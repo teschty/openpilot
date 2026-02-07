@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import io
 import json
 import os
 import random
@@ -8,12 +7,12 @@ import threading
 import time
 import traceback
 import datetime
-import zstandard as zstd
 from collections.abc import Iterator
 
 from cereal import log
 import cereal.messaging as messaging
 from openpilot.common.api import Api
+from openpilot.common.utils import get_upload_stream
 from openpilot.common.params import Params
 from openpilot.common.realtime import set_core_affinity
 from openpilot.system.hardware.hw import Paths
@@ -29,9 +28,8 @@ MAX_UPLOAD_SIZES = {
                    # bugs, including ones that can cause massive log sizes
   "qcam": 5*1e6,
 }
-LOG_COMPRESSION_LEVEL = 10  # little benefit up to level 15. level ~17 is a small step change
 
-allow_sleep = bool(os.getenv("UPLOADER_SLEEP", "1"))
+allow_sleep = bool(int(os.getenv("UPLOADER_SLEEP", "1")))
 force_wifi = os.getenv("FORCEWIFI") is not None
 fake_upload = os.getenv("FAKEUPLOAD") is not None
 
@@ -90,8 +88,8 @@ class Uploader:
     self.immediate_priority = {"qlog": 0, "qlog.zst": 0, "qcamera.ts": 1}
 
   def list_upload_files(self, metered: bool) -> Iterator[tuple[str, str, str]]:
-    r = self.params.get("AthenadRecentlyViewedRoutes", encoding="utf8")
-    requested_routes = [] if r is None else r.split(",")
+    r = self.params.get("AthenadRecentlyViewedRoutes")
+    requested_routes = [] if r is None else [route for route in r.split(",") if route]
 
     for logdir in listdir_by_creation(self.root):
       path = os.path.join(self.root, logdir)
@@ -154,13 +152,15 @@ class Uploader:
     if fake_upload:
       return FakeResponse()
 
-    with open(fn, "rb") as f:
-      content = f.read()
-      if key.endswith('.zst') and not fn.endswith('.zst'):
-        content = zstd.compress(content, LOG_COMPRESSION_LEVEL)
-
-      with io.BytesIO(content) as data:
-        return requests.put(url, data=data, headers=headers, timeout=10)
+    stream = None
+    try:
+      compress = key.endswith('.zst') and not fn.endswith('.zst')
+      stream, _ = get_upload_stream(fn, compress)
+      response = requests.put(url, data=stream, headers=headers, timeout=10)
+      return response
+    finally:
+      if stream:
+        stream.close()
 
   def upload(self, name: str, key: str, fn: str, network_type: int, metered: bool) -> bool:
     try:
@@ -226,7 +226,7 @@ class Uploader:
     return self.upload(name, key, fn, network_type, metered)
 
 
-def main(exit_event: threading.Event = None) -> None:
+def main(exit_event: threading.Event | None = None) -> None:
   if exit_event is None:
     exit_event = threading.Event()
 
@@ -238,7 +238,7 @@ def main(exit_event: threading.Event = None) -> None:
   clear_locks(Paths.log_root())
 
   params = Params()
-  dongle_id = params.get("DongleId", encoding='utf8')
+  dongle_id = params.get("DongleId")
 
   if dongle_id is None:
     cloudlog.info("uploader missing dongle_id")

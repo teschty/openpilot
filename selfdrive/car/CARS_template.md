@@ -12,18 +12,18 @@
 
 A supported vehicle is one that just works when you install a comma device. All supported cars provide a better experience than any stock system. Supported vehicles reference the US market unless otherwise specified.
 
-# {{all_car_docs | length}} Supported Cars
+# {{all_car_docs | selectattr('support_type', 'eq', SupportType.UPSTREAM) | list | length}} Supported Cars
 
 |{{Column | map(attribute='value') | join('|') | replace(hardware_col_name, wide_hardware_col_name)}}|
 |---|---|---|{% for _ in range((Column | length) - 3) %}{{':---:|'}}{% endfor +%}
-{% for car_docs in all_car_docs %}
+{% for car_docs in all_car_docs | selectattr('support_type', 'eq', SupportType.UPSTREAM) %}
 |{% for column in Column %}{{car_docs.get_column(column, star_icon, video_icon, footnote_tag)}}|{% endfor %}
 
 {% endfor %}
 
 ### Footnotes
 {% for footnote in footnotes %}
-<sup>{{loop.index}}</sup>{{footnote}} <br />
+<sup>{{loop.index}}</sup>{{footnote | replace('</br>', '')}} <br />
 {% endfor %}
 
 ## Community Maintained Cars
@@ -42,7 +42,7 @@ If your car has the following packages or features, then it's a good candidate f
 
 | Make | Required Package/Features |
 | ---- | ------------------------- |
-| Acura | Any car with AcuraWatch Plus will work. AcuraWatch Plus comes standard on many newer models. |
+| Acura | Any car with AcuraWatch will work. AcuraWatch comes standard on many newer models. |
 | Ford | Any car with Lane Centering will likely work. |
 | Honda | Any car with Honda Sensing will work. Honda Sensing comes standard on many newer models. |
 | Subaru | Any car with EyeSight will work. EyeSight comes standard on many newer models. |

@@ -1,7 +1,9 @@
-# Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
-#
-# This file is part of sunnypilot and is licensed under the MIT License.
-# See the LICENSE.md file in the root directory for more details.
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
+
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+"""
 
 import asyncio
 import os
@@ -14,8 +16,8 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.system.hardware.hw import Paths
 
 from cereal import messaging, custom
-from sunnypilot.models.fetcher import ModelFetcher
-from sunnypilot.models.helpers import verify_file, get_active_bundle
+from openpilot.sunnypilot.models.fetcher import ModelFetcher
+from openpilot.sunnypilot.models.helpers import verify_file, get_active_bundle
 
 
 class ModelManagerSP:
@@ -61,6 +63,9 @@ class ModelManagerSP:
             f.write(chunk)
             bytes_downloaded += len(chunk)
 
+            if not self.params.get("ModelManager_DownloadIndex"):
+              raise Exception("Download cancelled")
+
             if total_size > 0:
               progress = (bytes_downloaded / total_size) * 100
               model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.downloading
@@ -71,42 +76,53 @@ class ModelManagerSP:
         # Clean up start time after download completes
         del self._download_start_times[model.fileName]
 
-  async def _process_model(self, model, destination_path: str) -> None:
+  async def _process_artifact(self, artifact, destination_path: str) -> None:
     """Processes a single model download including verification"""
-    url = model.downloadUri.uri
-    expected_hash = model.downloadUri.sha256
-    filename = model.fileName
+    if not artifact.downloadUri.uri:
+      return None
+
+    url = artifact.downloadUri.uri
+    expected_hash = artifact.downloadUri.sha256
+    filename = artifact.fileName
     full_path = os.path.join(destination_path, filename)
 
     try:
       # Check existing file
       if os.path.exists(full_path) and await verify_file(full_path, expected_hash):
-        model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.cached
-        model.downloadProgress.progress = 100
-        model.downloadProgress.eta = 0
+        artifact.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.cached
+        artifact.downloadProgress.progress = 100
+        artifact.downloadProgress.eta = 0
         self._report_status()
         return
 
       # Download and verify
-      await self._download_file(url, full_path, model)
+      await self._download_file(url, full_path, artifact)
       if not await verify_file(full_path, expected_hash):
         raise ValueError(f"Hash validation failed for {filename}")
 
-      model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.downloaded
-      model.downloadProgress.eta = 0
+      artifact.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.downloaded
+      artifact.downloadProgress.eta = 0
       self._report_status()
 
     except Exception as e:
       cloudlog.error(f"Error downloading {filename}: {str(e)}")
       if os.path.exists(full_path):
         os.remove(full_path)
-      model.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.failed
-      model.downloadProgress.eta = 0
+      artifact.downloadProgress.status = custom.ModelManagerSP.DownloadStatus.failed
+      artifact.downloadProgress.eta = 0
       self.selected_bundle.status = custom.ModelManagerSP.DownloadStatus.failed
       self._report_status()
       # Clean up start time if it exists
-      self._download_start_times.pop(model.fileName, None)
+      self._download_start_times.pop(artifact.fileName, None)
       raise
+
+  async def _process_model(self, model, destination_path: str) -> None:
+    """Processes a single model download including verification"""
+    model_artifact = model.artifact
+    metadata_artifact = model.metadata
+
+    await self._process_artifact(metadata_artifact, destination_path)
+    await self._process_artifact(model_artifact, destination_path)
 
   def _report_status(self) -> None:
     """Reports current status through messaging system"""
@@ -132,7 +148,7 @@ class ModelManagerSP:
       await asyncio.gather(*tasks)
       self.active_bundle = self.selected_bundle
       self.active_bundle.status = custom.ModelManagerSP.DownloadStatus.downloaded
-      self.params.put("ModelManager_ActiveBundle", self.active_bundle.to_bytes())
+      self.params.put("ModelManager_ActiveBundle", self.active_bundle.to_dict())
       self.selected_bundle = None
 
     except Exception:
@@ -152,17 +168,22 @@ class ModelManagerSP:
 
     while True:
       try:
-        self.available_models = self.model_fetcher.get_available_models()
+        self.available_models = self.model_fetcher.get_available_bundles()
         self.active_bundle = get_active_bundle(self.params)
 
-        if index_to_download := self.params.get("ModelManager_DownloadIndex", block=False, encoding="utf-8"):
-          if model_to_download := next((model for model in self.available_models if model.index == int(index_to_download)), None):
+        if index_to_download := self.params.get("ModelManager_DownloadIndex"):
+          if model_to_download := next((model for model in self.available_models if model.index == index_to_download), None):
             try:
               self.download(model_to_download, Paths.model_root())
             except Exception as e:
               cloudlog.exception(e)
             finally:
-              self.params.put("ModelManager_DownloadIndex", "")
+              self.params.remove("ModelManager_DownloadIndex")
+              self.selected_bundle = None
+
+        if self.params.get("ModelManager_ClearCache"):
+            self.clear_model_cache()
+            self.params.remove("ModelManager_ClearCache")
 
         self._report_status()
         rk.keep_time()
@@ -171,6 +192,31 @@ class ModelManagerSP:
         cloudlog.exception(f"Error in main thread: {str(e)}")
         rk.keep_time()
 
+  def clear_model_cache(self) -> None:
+    """
+    Clears the model cache directory of all files except those in the active model bundle.
+    """
+
+    # Get list of files used by active model bundle
+    active_files = []
+    if self.active_bundle is not None: # When the default model is active
+      for model in self.active_bundle.models:
+        if hasattr(model, 'artifact') and model.artifact.fileName:
+          active_files.append(model.artifact.fileName)
+        if hasattr(model, 'metadata') and model.metadata.fileName:
+          active_files.append(model.metadata.fileName)
+
+    # Remove all files except active ones
+    model_dir = Paths.model_root()
+    try:
+      for filename in os.listdir(model_dir):
+        if filename not in active_files:
+          file_path = os.path.join(model_dir, filename)
+          if os.path.isfile(file_path):
+            os.remove(file_path)
+      cloudlog.info("Model cache cleared, keeping active model files")
+    except Exception as e:
+      cloudlog.exception(f"Error clearing model cache: {str(e)}")
 
 def main():
   ModelManagerSP().main_thread()

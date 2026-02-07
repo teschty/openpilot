@@ -30,8 +30,8 @@ class Plant:
 
     self.distance = 0.
     self.speed = speed
+    self.should_stop = False
     self.acceleration = 0.0
-    self.speeds = []
 
     # lead car
     self.lead_relevancy = lead_relevancy
@@ -51,7 +51,9 @@ class Plant:
     from opendbc.car.honda.values import CAR
     from opendbc.car.honda.interface import CarInterface
 
-    self.planner = LongitudinalPlanner(CarInterface.get_non_essential_params(CAR.HONDA_CIVIC), init_v=self.speed)
+    CP = CarInterface.get_non_essential_params(CAR.HONDA_CIVIC)
+    CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.HONDA_CIVIC)
+    self.planner = LongitudinalPlanner(CP, CP_SP, init_v=self.speed)
 
   @property
   def current_time(self):
@@ -67,6 +69,9 @@ class Plant:
     lp = messaging.new_message('liveParameters')
     car_control = messaging.new_message('carControl')
     model = messaging.new_message('modelV2')
+    car_state_sp = messaging.new_message('carStateSP')
+    live_map_data_sp = messaging.new_message('liveMapDataSP')
+    gps_data = messaging.new_message('gpsLocation')
     a_lead = (v_lead - self.v_lead_prev)/self.ts
     self.v_lead_prev = v_lead
 
@@ -107,6 +112,7 @@ class Plant:
     position = log.XYZTData.new_message()
     position.x = [float(x) for x in (self.speed + 0.5) * np.array(ModelConstants.T_IDXS)]
     model.modelV2.position = position
+    model.modelV2.action.desiredAcceleration = float(self.acceleration + 0.1)
     velocity = log.XYZTData.new_message()
     velocity.x = [float(x) for x in (self.speed + 0.5) * np.ones_like(ModelConstants.T_IDXS)]
     velocity.x[0] = float(self.speed) # always start at current speed
@@ -132,11 +138,14 @@ class Plant:
           'controlsState': control.controlsState,
           'selfdriveState': ss.selfdriveState,
           'liveParameters': lp.liveParameters,
-          'modelV2': model.modelV2}
+          'modelV2': model.modelV2,
+          'carStateSP': car_state_sp.carStateSP,
+          'liveMapDataSP': live_map_data_sp.liveMapDataSP,
+          'gpsLocation': gps_data.gpsLocation}
     self.planner.update(sm)
-    self.speed = self.planner.v_desired_filter.x
-    self.acceleration = self.planner.a_desired
-    self.speeds = self.planner.v_desired_trajectory.tolist()
+    self.acceleration = self.planner.output_a_target
+    self.speed = self.speed + self.acceleration * self.ts
+    self.should_stop = self.planner.output_should_stop
     fcw = self.planner.fcw
     self.distance_lead = self.distance_lead + v_lead * self.ts
 
@@ -168,7 +177,7 @@ class Plant:
       "distance": self.distance,
       "speed": self.speed,
       "acceleration": self.acceleration,
-      "speeds": self.speeds,
+      "should_stop": self.should_stop,
       "distance_lead": self.distance_lead,
       "fcw": fcw,
     }

@@ -3,6 +3,7 @@ import capnp
 import numpy as np
 from cereal import log
 from openpilot.sunnypilot.modeld.constants import ModelConstants, Plan
+from openpilot.sunnypilot.models.helpers import plan_x_idxs_helper
 from openpilot.sunnypilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_lag_adjusted_curvature, MIN_SPEED
 
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
@@ -50,7 +51,7 @@ def fill_xyz_poly(builder, degree, x, y, z):
   builder.zCoefficients = coeffs[:, 2].tolist()
 
 def fill_model_msg(base_msg: capnp._DynamicStructBuilder, extended_msg: capnp._DynamicStructBuilder,
-                   net_output_data: dict[str, np.ndarray], publish_state: PublishState,
+                   net_output_data: dict[str, np.ndarray], action: log.ModelDataV2.Action, publish_state: PublishState,
                    vipc_frame_id: int, vipc_frame_id_extra: int, frame_id: int, frame_drop: float,
                    timestamp_eof: int, model_execution_time: float, valid: bool,
                    v_ego: float, steer_delay: float, meta_const) -> None:
@@ -76,8 +77,11 @@ def fill_model_msg(base_msg: capnp._DynamicStructBuilder, extended_msg: capnp._D
   driving_model_data.frameDropPerc = frame_drop_perc
   driving_model_data.modelExecutionTime = model_execution_time
 
-  action = driving_model_data.action
-  action.desiredCurvature = desired_curvature
+  # Populate drivingModelData.action
+  driving_model_data_action = driving_model_data.action
+  driving_model_data_action.desiredAcceleration = action.desiredAcceleration
+  driving_model_data_action.shouldStop = action.shouldStop
+  driving_model_data_action.desiredCurvature = desired_curvature
 
   modelV2 = extended_msg.modelV2
   modelV2.frameId = vipc_frame_id
@@ -100,7 +104,7 @@ def fill_model_msg(base_msg: capnp._DynamicStructBuilder, extended_msg: capnp._D
   fill_xyzt(orientation_rate, ModelConstants.T_IDXS, *net_output_data['plan'][0,:,Plan.ORIENTATION_RATE].T)
 
   # temporal pose
-  temporal_pose = modelV2.temporalPose
+  temporal_pose = modelV2.temporalPoseDEPRECATED
   temporal_pose.trans = net_output_data['plan'][0,0,Plan.VELOCITY].tolist()
   temporal_pose.transStd = net_output_data['plan_stds'][0,0,Plan.VELOCITY].tolist()
   temporal_pose.rot = net_output_data['plan'][0,0,Plan.ORIENTATION_RATE].tolist()
@@ -111,27 +115,13 @@ def fill_model_msg(base_msg: capnp._DynamicStructBuilder, extended_msg: capnp._D
   fill_xyz_poly(poly_path, ModelConstants.POLY_PATH_DEGREE, *net_output_data['plan'][0,:,Plan.POSITION].T)
 
   # lateral planning
-  action = modelV2.action
-  action.desiredCurvature = desired_curvature
+  modelV2_action = modelV2.action
+  modelV2_action.desiredAcceleration = action.desiredAcceleration
+  modelV2_action.shouldStop = action.shouldStop
+  modelV2_action.desiredCurvature = desired_curvature
 
   # times at X_IDXS according to model plan
-  PLAN_T_IDXS = [np.nan] * ModelConstants.IDX_N
-  PLAN_T_IDXS[0] = 0.0
-  plan_x = net_output_data['plan'][0,:,Plan.POSITION][:,0].tolist()
-  for xidx in range(1, ModelConstants.IDX_N):
-    tidx = 0
-    # increment tidx until we find an element that's further away than the current xidx
-    while tidx < ModelConstants.IDX_N - 1 and plan_x[tidx+1] < ModelConstants.X_IDXS[xidx]:
-      tidx += 1
-    if tidx == ModelConstants.IDX_N - 1:
-      # if the Plan doesn't extend far enough, set plan_t to the max value (10s), then break
-      PLAN_T_IDXS[xidx] = ModelConstants.T_IDXS[ModelConstants.IDX_N - 1]
-      break
-    # interpolate to find `t` for the current xidx
-    current_x_val = plan_x[tidx]
-    next_x_val = plan_x[tidx+1]
-    p = (ModelConstants.X_IDXS[xidx] - current_x_val) / (next_x_val - current_x_val) if abs(next_x_val - current_x_val) > 1e-9 else float('nan')
-    PLAN_T_IDXS[xidx] = p * ModelConstants.T_IDXS[tidx+1] + (1 - p) * ModelConstants.T_IDXS[tidx]
+  PLAN_T_IDXS: list[float] = plan_x_idxs_helper(ModelConstants, Plan, net_output_data)
 
   # lane lines
   modelV2.init('laneLines', 4)

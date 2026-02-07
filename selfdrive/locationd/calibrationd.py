@@ -6,17 +6,17 @@ While the roll calibration is a real value that can be estimated, here we assume
 and the image input into the neural network is not corrected for roll.
 '''
 
-import gc
 import os
 import capnp
 import numpy as np
 from typing import NoReturn
 
-from cereal import log
+from cereal import log, car
 import cereal.messaging as messaging
-from openpilot.common.conversions import Conversions as CV
+from openpilot.system.hardware import HARDWARE
+from openpilot.common.constants import CV
 from openpilot.common.params import Params
-from openpilot.common.realtime import set_realtime_priority
+from openpilot.common.realtime import config_realtime_process
 from openpilot.common.transformations.orientation import rot_from_euler, euler_from_rot
 from openpilot.common.swaglog import cloudlog
 
@@ -37,14 +37,17 @@ RPY_INIT = np.array([0.0,0.0,0.0])
 WIDE_FROM_DEVICE_EULER_INIT = np.array([0.0, 0.0, 0.0])
 HEIGHT_INIT = np.array([1.22])
 
-# These values are needed to accommodate the model frame in the narrow cam of the C3
-PITCH_LIMITS = np.array([-0.09074112085129739, 0.17])
+# These values are needed to accommodate the model frame in the narrow cam
+if HARDWARE.get_device_type() == 'mici':
+  PITCH_LIMITS = np.array([-0.143101, 0.22235988])
+else:
+  PITCH_LIMITS = np.array([-0.09074112085129739, 0.17])
 YAW_LIMITS = np.array([-0.06912048084718224, 0.06912048084718235])
 DEBUG = os.getenv("DEBUG") is not None
 
 
 def is_calibration_valid(rpy: np.ndarray) -> bool:
-  return (PITCH_LIMITS[0] < rpy[1] < PITCH_LIMITS[1]) and (YAW_LIMITS[0] < rpy[2] < YAW_LIMITS[1])  # type: ignore
+  return (PITCH_LIMITS[0] < rpy[1] < PITCH_LIMITS[1]) and (YAW_LIMITS[0] < rpy[2] < YAW_LIMITS[1])
 
 
 def sanity_clip(rpy: np.ndarray) -> np.ndarray:
@@ -89,7 +92,7 @@ class Calibrator:
                   valid_blocks: int = 0,
                   wide_from_device_euler_init: np.ndarray = WIDE_FROM_DEVICE_EULER_INIT,
                   height_init: np.ndarray = HEIGHT_INIT,
-                  smooth_from: np.ndarray = None) -> None:
+                  smooth_from: np.ndarray | None = None) -> None:
     if not np.isfinite(rpy_init).all():
       self.rpy = RPY_INIT.copy()
     else:
@@ -256,19 +259,20 @@ class Calibrator:
 
 
 def main() -> NoReturn:
-  gc.disable()
-  set_realtime_priority(1)
+  config_realtime_process([0, 1, 2, 3], 5)
 
   pm = messaging.PubMaster(['liveCalibration'])
-  sm = messaging.SubMaster(['cameraOdometry', 'carState', 'carParams'], poll='cameraOdometry')
+  sm = messaging.SubMaster(['cameraOdometry', 'carState'], poll='cameraOdometry')
+
+  params_reader = Params()
+  CP = messaging.log_from_bytes(params_reader.get("CarParams", block=True), car.CarParams)
 
   calibrator = Calibrator(param_put=True)
+  calibrator.not_car = CP.notCar
 
   while 1:
     timeout = 0 if sm.frame == -1 else 100
     sm.update(timeout)
-
-    calibrator.not_car = sm['carParams'].notCar
 
     if sm.updated['cameraOdometry']:
       calibrator.handle_v_ego(sm['carState'].vEgo)

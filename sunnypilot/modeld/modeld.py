@@ -13,17 +13,23 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import DT_MDL, config_realtime_process
-from openpilot.common.numpy_fast import interp
+from numpy import interp
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.common.transformations.model import get_warp_matrix
 from openpilot.system import sentry
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
+from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
+
+from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld.runners import ModelRunner, Runtime
 from openpilot.sunnypilot.modeld.parse_model_outputs import Parser
 from openpilot.sunnypilot.modeld.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState
-from openpilot.sunnypilot.modeld.constants import ModelConstants
+from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
+from openpilot.sunnypilot.modeld.constants import ModelConstants, Plan
+from openpilot.sunnypilot.models.helpers import get_active_bundle, get_model_path, load_metadata, prepare_inputs, load_meta_constants
 from openpilot.sunnypilot.modeld.models.commonmodel_pyx import ModelFrame, CLContext
-from openpilot.sunnypilot.modeld.runners.run_helpers import get_model_path, load_metadata, prepare_inputs, load_meta_constants
+from openpilot.sunnypilot.modeld.modeld_base import ModelStateBase
+
 
 PROCESS_NAME = "selfdrive.modeld.modeld_snpe"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
@@ -34,6 +40,7 @@ MODEL_PATHS = {
 
 METADATA_PATH = Path(__file__).parent / 'models/supercombo_metadata.pkl'
 
+
 class FrameMeta:
   frame_id: int = 0
   timestamp_sof: int = 0
@@ -43,7 +50,7 @@ class FrameMeta:
     if vipc is not None:
       self.frame_id, self.timestamp_sof, self.timestamp_eof = vipc.frame_id, vipc.timestamp_sof, vipc.timestamp_eof
 
-class ModelState:
+class ModelState(ModelStateBase):
   frame: ModelFrame
   wide_frame: ModelFrame
   inputs: dict[str, np.ndarray]
@@ -52,9 +59,14 @@ class ModelState:
   model: ModelRunner
 
   def __init__(self, context: CLContext):
+    ModelStateBase.__init__(self)
     self.frame = ModelFrame(context)
     self.wide_frame = ModelFrame(context)
     self.prev_desire = np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32)
+    bundle = get_active_bundle()
+    overrides = {override.key: override.value for override in bundle.overrides}
+    self.LAT_SMOOTH_SECONDS = float(overrides.get('lat', ".0"))
+    self.LONG_SMOOTH_SECONDS = float(overrides.get('long', ".0"))
 
     model_paths = get_model_path()
     self.model_metadata = load_metadata()
@@ -118,6 +130,15 @@ class ModelState:
         self.inputs['prev_desired_curv'][-1:] = outputs['desired_curvature'][0, :]
     return outputs
 
+  def get_action_from_model(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
+                            long_action_t: float) -> log.ModelDataV2.Action:
+    plan = model_output['plan'][0]
+    desired_accel, should_stop = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0], ModelConstants.T_IDXS,
+                                                     action_t=long_action_t)
+    desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, self.LONG_SMOOTH_SECONDS)
+
+    return log.ModelDataV2.Action(desiredAcceleration=float(desired_accel), shouldStop=bool(should_stop))
+
 
 def main(demo=False):
   cloudlog.warning("modeld init")
@@ -157,8 +178,8 @@ def main(demo=False):
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
   # messaging
-  pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry"])
-  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl"])
+  pm = PubMaster(["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"])
+  sm = SubMaster(["deviceState", "carState", "roadCameraState", "liveCalibration", "driverMonitoringState", "carControl", "liveDelay"])
 
   publish_state = PublishState()
   params = Params()
@@ -175,6 +196,7 @@ def main(demo=False):
   buf_main, buf_extra = None, None
   meta_main = FrameMeta()
   meta_extra = FrameMeta()
+  camera_offset_helper = CameraOffsetHelper()
 
 
   if demo:
@@ -184,8 +206,9 @@ def main(demo=False):
 
   cloudlog.info("modeld got CarParams: %s", CP.brand)
 
-  # TODO this needs more thought, use .2s extra for now to estimate other delays
-  steer_delay = CP.steerActuatorDelay + .2
+  # Enable lagd support for sunnypilot modeld
+  long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
+  prev_action = log.ModelDataV2.Action()
 
   DH = DesireHelper()
 
@@ -227,11 +250,16 @@ def main(demo=False):
     v_ego = sm["carState"].vEgo
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["roadCameraState"].frameId
+    if sm.frame % 60 == 0:
+      model.lat_delay = get_lat_delay(params, sm["liveDelay"].lateralDelay)
+      camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
+    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
     if sm.updated["liveCalibration"] and sm.seen['roadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["liveCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['roadCameraState'].sensor))]
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
       model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics, True).astype(np.float32)
+      model_transform_main, model_transform_extra = camera_offset_helper.update(model_transform_main, model_transform_extra, sm, main_wide_camera)
       live_calib_seen = True
 
     traffic_convention = np.zeros(2)
@@ -260,7 +288,7 @@ def main(demo=False):
       }
 
     if "lateral_control_params" in model.inputs.keys():
-      inputs['lateral_control_params'] = np.array([max(v_ego, 0.), steer_delay], dtype=np.float32)
+      inputs['lateral_control_params'] = np.array([max(v_ego, 0.), lat_delay], dtype=np.float32)
 
     if "driving_style" in model.inputs.keys():
       inputs['driving_style'] = np.array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0], dtype=np.float32)
@@ -280,9 +308,11 @@ def main(demo=False):
       modelv2_send = messaging.new_message('modelV2')
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
+      mdv2sp_send = messaging.new_message('modelDataV2SP')
+      action = model.get_action_from_model(model_output, prev_action, long_delay + DT_MDL)
+      fill_model_msg(drivingdata_send, modelv2_send, model_output, action, publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen,
-                     v_ego, steer_delay, model.meta)
+                     v_ego, lat_delay, model.meta)
 
       desire_state = modelv2_send.modelV2.meta.desireState
       l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
@@ -291,6 +321,7 @@ def main(demo=False):
       DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
+      mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction
       drivingdata_send.drivingModelData.meta.laneChangeState = DH.lane_change_state
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
@@ -298,6 +329,7 @@ def main(demo=False):
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
+      pm.send('modelDataV2SP', mdv2sp_send)
 
     last_vipc_frame_id = meta_main.frame_id
 

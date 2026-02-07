@@ -8,6 +8,7 @@ ROOT = HERE + "/.."
 
 blacklist = [
   ".git/",
+  ".github/workflows/",
 
   "matlab.*.md",
 
@@ -16,6 +17,8 @@ blacklist = [
   ".gitattributes",
   ".git$",
   ".gitmodules",
+  ".run/",
+  ".idea/",
 ]
 
 # gets you through the blacklist

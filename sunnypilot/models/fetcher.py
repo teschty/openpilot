@@ -1,14 +1,17 @@
-# Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
-#
-# This file is part of sunnypilot and is licensed under the MIT License.
-# See the LICENSE.md file in the root directory for more details.
+"""
+Copyright (c) 2021-, Haibin Wen, sunnypilot, and a number of other contributors.
 
-import json
+This file is part of sunnypilot and is licensed under the MIT License.
+See the LICENSE.md file in the root directory for more details.
+"""
+
 import time
 
 import requests
+from requests.exceptions import (SSLError, RequestException, HTTPError)
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.sunnypilot.models.helpers import is_bundle_version_compatible
 
 from cereal import custom
 
@@ -17,68 +20,61 @@ class ModelParser:
   """Handles parsing of model data into cereal objects"""
 
   @staticmethod
-  def _parse_model(full_name: str, file_name: str, uri_data: dict,
-                   model_type: custom.ModelManagerSP.Type) -> custom.ModelManagerSP.Model:
-    model = custom.ModelManagerSP.Model()
+  def _parse_download_uri(download_uri_data) -> custom.ModelManagerSP.DownloadUri:
     download_uri = custom.ModelManagerSP.DownloadUri()
+    download_uri.uri = download_uri_data.get("url")
+    download_uri.sha256 = download_uri_data.get("sha256")
+    return download_uri
 
-    download_uri.uri = uri_data["url"]
-    download_uri.sha256 = uri_data["sha256"]
+  @staticmethod
+  def _parse_artifact(artifact_data) -> custom.ModelManagerSP.Artifact:
+    artifact = custom.ModelManagerSP.Artifact()
+    artifact.fileName = artifact_data.get("file_name")
+    artifact.downloadUri = ModelParser._parse_download_uri(artifact_data.get("download_uri", {}))
+    return artifact
 
-    model.fullName = full_name
-    model.fileName = file_name
-    model.downloadUri = download_uri
-    model.type = model_type
+  @staticmethod
+  def _parse_model(model_data) -> custom.ModelManagerSP.Model:
+    model = custom.ModelManagerSP.Model()
 
+    model.type = model_data.get("type")
+    model.artifact = ModelParser._parse_artifact(model_data.get("artifact", {}))
+    if metadata := model_data.get("metadata"):
+      model.metadata = ModelParser._parse_artifact(metadata)
     return model
 
   @staticmethod
-  def _parse_bundle(key: str, value: dict) -> custom.ModelManagerSP.ModelBundle:
+  def _parse_overrides(overrides_data: dict[str, str]) -> list[custom.ModelManagerSP.Override]:
+    overrides = []
+    for key, value in overrides_data.items():
+      override = custom.ModelManagerSP.Override()
+      override.key = key
+      override.value = value
+      overrides.append(override)
+    return overrides
+
+  @staticmethod
+  def _parse_bundle(bundle) -> custom.ModelManagerSP.ModelBundle:
     model_bundle = custom.ModelManagerSP.ModelBundle()
-
-    # Parse main driving model
-    models = [
-      ModelParser._parse_model(
-        value["full_name"],
-        value["file_name"],
-        value["download_uri"],
-        custom.ModelManagerSP.Type.drive
-      )
-    ]
-
-    # Parse navigation model if exists
-    if value.get("download_uri_nav"):
-      models.append(ModelParser._parse_model(
-        value["full_name_nav"],
-        value["file_name_nav"],
-        value["download_uri_nav"],
-        custom.ModelManagerSP.Type.navigation
-      ))
-
-    # Parse metadata model if exists
-    if value.get("download_uri_metadata"):
-      models.append(ModelParser._parse_model(
-        value["full_name_metadata"],
-        value["file_name_metadata"],
-        value["download_uri_metadata"],
-        custom.ModelManagerSP.Type.metadata
-      ))
-
-    model_bundle.index = int(value["index"])
-    model_bundle.internalName = key
-    model_bundle.displayName = value["display_name"]
-    model_bundle.models = models
+    model_bundle.index = int(bundle["index"])
+    model_bundle.internalName = bundle["short_name"]
+    model_bundle.displayName = bundle["display_name"]
+    model_bundle.models = [ModelParser._parse_model(model) for model in bundle.get("models",[])]
     model_bundle.status = 0
-    model_bundle.generation = int(value["generation"])
-    model_bundle.environment = value["environment"]
-    model_bundle.runner = value.get("runner", custom.ModelManagerSP.Runner.snpe)
-    model_bundle.is20hz = value.get("is_20hz", False)
+    model_bundle.generation = int(bundle["generation"])
+    model_bundle.environment = bundle["environment"]
+    model_bundle.runner = bundle.get("runner", custom.ModelManagerSP.Runner.snpe)
+    model_bundle.is20hz = bundle.get("is_20hz", False)
+    model_bundle.minimumSelectorVersion = int(bundle["minimum_selector_version"])
+    model_bundle.overrides = ModelParser._parse_overrides(bundle.get("overrides", {}))
+    model_bundle.ref = bundle.get("ref")
 
     return model_bundle
 
   @staticmethod
   def parse_models(json_data: dict) -> list[custom.ModelManagerSP.ModelBundle]:
-    return [ModelParser._parse_bundle(key, value) for key, value in json_data.items()]
+    found_bundles = [ModelParser._parse_bundle(bundle) for bundle in json_data.get("bundles", [])]
+    return [bundle for bundle in found_bundles if is_bundle_version_compatible(bundle.to_dict())]
 
 
 class ModelCache:
@@ -93,8 +89,8 @@ class ModelCache:
   def _is_expired(self) -> bool:
     """Checks if the cache has expired"""
     current_time = int(time.monotonic() * 1e9)
-    last_sync = int(self.params.get(self._LAST_SYNC_KEY, encoding="utf-8") or 0)
-    return last_sync == 0 or (current_time - last_sync) >= self.cache_timeout
+    last_sync = self.params.get(self._LAST_SYNC_KEY) or 0
+    return bool(last_sync == 0) or (current_time - last_sync) >= self.cache_timeout
 
   def get(self) -> tuple[dict, bool]:
     """
@@ -103,45 +99,62 @@ class ModelCache:
     If no cached data exists or on error, returns an empty dict
     """
     try:
-      cached_data = self.params.get(self._CACHE_KEY, encoding="utf-8")
+      cached_data = self.params.get(self._CACHE_KEY)
       if not cached_data:
         cloudlog.warning("No cached model data available")
         return {}, True
-      return json.loads(cached_data), self._is_expired()
+      return cached_data, self._is_expired()
     except Exception as e:
       cloudlog.exception(f"Error retrieving cached model data: {str(e)}")
       return {}, True
 
   def set(self, data: dict) -> None:
     """Updates the cache with new model data"""
-    self.params.put(self._CACHE_KEY, json.dumps(data))
-    self.params.put(self._LAST_SYNC_KEY, str(int(time.monotonic() * 1e9)))
+    self.params.put(self._CACHE_KEY, data)
+    self.params.put(self._LAST_SYNC_KEY, int(time.monotonic() * 1e9))
 
 
 class ModelFetcher:
   """Handles fetching and caching of model data from remote source"""
-  MODEL_URL = "https://docs.sunnypilot.ai/driving_models.json"
+  MODEL_URL = "https://raw.githubusercontent.com/sunnypilot/sunnypilot-docs/refs/heads/gh-pages/docs/driving_models_v11.json"
 
   def __init__(self, params: Params):
     self.params = params
     self.model_cache = ModelCache(params)
     self.model_parser = ModelParser()
 
-  def _fetch_and_cache_models(self) -> list[custom.ModelManagerSP.ModelBundle]:
-    """Fetches fresh model data from remote and updates cache"""
+  def _fetch_and_cache_models(self) -> list[custom.ModelManagerSP.ModelBundle] | None:
+    """Fetches fresh model data from remote and updates cache.
+    Returns None on transport errors. Raises on 404 and other fatal HTTP errors.
+    """
     try:
       response = requests.get(self.MODEL_URL, timeout=10)
-      response.raise_for_status()
-      json_data = response.json()
 
+      # Explicitly handle 404 differently
+      if response.status_code == 404:
+        cloudlog.error(f"Models URL returned 404 Not Found: {self.MODEL_URL}")
+        raise HTTPError(f"404 Not Found: {self.MODEL_URL}", response=response)
+
+      # Raise for any other 4xx/5xx
+      response.raise_for_status()
+
+      json_data = response.json()
       self.model_cache.set(json_data)
       cloudlog.debug("Successfully updated models cache")
       return self.model_parser.parse_models(json_data)
-    except Exception:
-      cloudlog.exception("Error fetching models")
-      raise
 
-  def get_available_models(self) -> list[custom.ModelManagerSP.ModelBundle]:
+    except ConnectionError as e:
+      cloudlog.warning(f"DNS/connection error while fetching models: {e}")
+    except SSLError as e:
+      cloudlog.warning(f"SSL error while fetching models: {e}")
+    except RequestException as e:
+      cloudlog.warning(f"Request transport error while fetching models: {e}")
+    except Exception as e:
+      cloudlog.exception(f"Unexpected error fetching models: {e}")
+
+    return None
+
+  def get_available_bundles(self) -> list[custom.ModelManagerSP.ModelBundle]:
     """Gets the list of available models, with smart cache handling"""
     cached_data, is_expired = self.model_cache.get()
 
@@ -149,12 +162,26 @@ class ModelFetcher:
       cloudlog.debug("Using valid cached models data")
       return self.model_parser.parse_models(cached_data)
 
-    try:
-      return self._fetch_and_cache_models()
-    except Exception:
-      if not cached_data:
-        cloudlog.exception("Failed to fetch fresh data and no cache available")
-        raise
+    fetched_bundles = self._fetch_and_cache_models()
+    if fetched_bundles is not None:
+      return fetched_bundles
+
+    if not cached_data:
+      cloudlog.warning("Failed to fetch fresh data and no cache available")
 
     cloudlog.warning("Failed to fetch fresh data. Using expired cache as fallback")
     return self.model_parser.parse_models(cached_data)
+
+if __name__ == "__main__":
+  params = Params()
+  model_fetcher = ModelFetcher(params)
+  bundles = model_fetcher.get_available_bundles()
+  for bundle in bundles:
+    for model in bundle.models:
+      model_overrides = {override.key: override.value for override in bundle.overrides}
+      # Print model details
+      print(f"Bundle: {bundle.internalName}, Type: {model.type}, Status: {bundle.status}, Overrides: {model_overrides}")
+      # Print artifact details
+      print(f"Artifact: {model.artifact.fileName}, Download URI: {model.artifact.downloadUri.uri}")
+      # Print metadata details
+      print(f"Metadata: {model.metadata.fileName}, Download URI: {model.metadata.downloadUri.uri}")
