@@ -105,6 +105,14 @@ class VisualsLayout(Widget):
       )
       self._toggles[param] = toggle
 
+    self._chime_delay = multiple_button_item_sp(
+      title=lambda: tr("Alert Chime Delay"),
+      description=lambda: tr("How long the condition must hold before the Green Light or Lead Departure chime plays."),
+      buttons=[lambda: tr("Short (0.3s)"), lambda: tr("Normal (1.0s)"), lambda: tr("Long (1.5s)")],
+      param="E2EChimeDelay",
+      inline=False
+    )
+
     self._chevron_info = multiple_button_item_sp(
       title=lambda: tr("Display Metrics Below Chevron"),
       description="",
@@ -122,6 +130,7 @@ class VisualsLayout(Widget):
     )
 
     items = list(self._toggles.values()) + [
+      self._chime_delay,
       self._chevron_info,
       self._dev_ui_info,
     ]
@@ -133,6 +142,7 @@ class VisualsLayout(Widget):
     for param in self._toggle_defs:
       self._toggles[param].action_item.set_state(self._params.get_bool(param))
 
+    self._chime_delay.action_item.set_selected_button(ui_state.params.get("E2EChimeDelay", return_default=True))
     self._dev_ui_info.action_item.set_selected_button(ui_state.params.get("DevUIInfo", return_default=True))
 
     if ui_state.has_longitudinal_control:

@@ -14,7 +14,13 @@ from openpilot.sunnypilot.selfdrive.selfdrived.events import EventsSP
 
 GREEN_LIGHT_X_THRESHOLD = 30
 LEAD_DEPART_DIST_THRESHOLD = 1.0
-TRIGGER_TIMER_THRESHOLD = 0.3
+
+CHIME_DELAY_OPTIONS = {
+  0: 0.3,
+  1: 1.0,
+  2: 1.5,
+}
+DEFAULT_TRIGGER_TIMER_THRESHOLD = 0.3
 
 
 class E2EStates:
@@ -37,6 +43,10 @@ class E2EAlertsHelper:
     self.lead_depart_alert = False
     self.lead_depart_alert_enabled = self._params.get_bool("LeadDepartAlert")
 
+    self.trigger_timer_threshold = CHIME_DELAY_OPTIONS.get(
+      self._params.get_int("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
+    )
+
     self.green_light_trigger_timer = 0
     self.lead_depart_trigger_timer = 0
     self.last_lead_distance = -1
@@ -54,6 +64,9 @@ class E2EAlertsHelper:
     if self.frame % int(PARAMS_UPDATE_PERIOD / DT_MDL) == 0:
       self.green_light_alert_enabled = self._params.get_bool("GreenLightAlert")
       self.lead_depart_alert_enabled = self._params.get_bool("LeadDepartAlert")
+      self.trigger_timer_threshold = CHIME_DELAY_OPTIONS.get(
+        self._params.get_int("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
+      )
 
   def update_alert_trigger(self, sm: messaging.SubMaster):
     CS = sm['carState']
@@ -81,7 +94,7 @@ class E2EAlertsHelper:
       else:
         self.green_light_trigger_timer = 0
 
-      if self.green_light_trigger_timer * DT_MDL > TRIGGER_TIMER_THRESHOLD:
+      if self.green_light_trigger_timer * DT_MDL > self.trigger_timer_threshold:
         green_light_trigger = True
     elif self.green_light_state != E2EStates.ARMED:
       self.green_light_trigger_timer = 0
@@ -112,7 +125,7 @@ class E2EAlertsHelper:
       else:
         self.lead_depart_trigger_timer = 0
 
-      if self.lead_depart_trigger_timer * DT_MDL > TRIGGER_TIMER_THRESHOLD:
+      if self.lead_depart_trigger_timer * DT_MDL > self.trigger_timer_threshold:
         lead_depart_trigger = True
     elif self.lead_depart_state != E2EStates.ARMED:
       self.last_lead_distance = -1
