@@ -44,7 +44,7 @@ class E2EAlertsHelper:
     self.lead_depart_alert_enabled = self._params.get_bool("LeadDepartAlert")
 
     self.trigger_timer_threshold = CHIME_DELAY_OPTIONS.get(
-      self._params.get_int("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
+      self._params.get("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
     )
 
     self.green_light_trigger_timer = 0
@@ -65,7 +65,7 @@ class E2EAlertsHelper:
       self.green_light_alert_enabled = self._params.get_bool("GreenLightAlert")
       self.lead_depart_alert_enabled = self._params.get_bool("LeadDepartAlert")
       self.trigger_timer_threshold = CHIME_DELAY_OPTIONS.get(
-        self._params.get_int("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
+        self._params.get("E2EChimeDelay"), DEFAULT_TRIGGER_TIMER_THRESHOLD
       )
 
   def update_alert_trigger(self, sm: messaging.SubMaster):
